@@ -12,7 +12,7 @@ import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
 
 logging.basicConfig(
@@ -394,7 +394,7 @@ def run_cycle():
 
     if not found:
         log.info("Sin señales — todos en ESPERAR")
-        now_utc    = datetime.utcnow()
+        now_utc    = datetime.now(timezone.utc).replace(tzinfo=None)
         now_madrid = now_utc + timedelta(hours=2)  # UTC+2 verano España
         # Resumen matinal 8:00-8:20h Madrid, solo lunes-viernes
         if now_madrid.hour == 8 and now_madrid.minute < 20 and now_madrid.weekday() < 5:
@@ -418,6 +418,26 @@ def main():
     log.info(f"Fuente: yfinance (gratis, sin API key)")
     log.info(f"Intervalo: {CHECK_INTERVAL//3600}h | SL×{SL_MULT} TP×{TP_MULT}")
     log.info(f"Telegram: {'✅' if TELEGRAM_TOKEN else '⚠️  no configurado'}")
+
+    # Mensaje de prueba si está activado via variable de entorno
+    if os.environ.get("SEND_TEST_MESSAGE", "").lower() == "true":
+        log.info("🧪 Modo prueba — enviando mensaje de test a Telegram...")
+        now_madrid = datetime.now(timezone.utc) + timedelta(hours=2)
+        ok = send_telegram(
+            f"✅ *Trading Signals PRO — Test OK*\n\n"
+            f"🚀 El sistema está funcionando correctamente.\n\n"
+            f"*Configuración activa:*\n"
+            f"  • Mercados: {', '.join(MARKETS.keys())}\n"
+            f"  • Intervalo: cada {CHECK_INTERVAL//3600}h\n"
+            f"  • SL: {SL_MULT}×ATR | TP: {TP_MULT}×ATR\n"
+            f"  • Hora Madrid: {now_madrid.strftime('%d/%m/%Y %H:%M')}\n\n"
+            f"_Cuando haya señal recibirás un mensaje como este pero con los niveles de entrada, SL y TP._\n\n"
+            f"⚠️ Recuerda borrar la variable SEND_TEST_MESSAGE en Railway."
+        )
+        if ok:
+            log.info("✅ Mensaje de prueba enviado correctamente a Telegram")
+        else:
+            log.error("❌ Error enviando mensaje de prueba — revisa TELEGRAM_TOKEN y TELEGRAM_CHAT_ID")
 
     while True:
         try:
