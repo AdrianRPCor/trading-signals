@@ -394,12 +394,18 @@ def run_cycle():
 
     if not found:
         log.info("Sin señales — todos en ESPERAR")
-        now = datetime.now()
-        if now.hour == 8 and now.minute < 20:
+        now_utc    = datetime.utcnow()
+        now_madrid = now_utc + timedelta(hours=2)  # UTC+2 verano España
+        # Resumen matinal 8:00-8:20h Madrid, solo lunes-viernes
+        if now_madrid.hour == 8 and now_madrid.minute < 20 and now_madrid.weekday() < 5:
+            market_summary = "\n".join(
+                f"  {MARKETS[s]['emoji']} {MARKETS[s]['name']}: ESPERAR"
+                for s in MARKETS
+            )
             send_telegram(
-                f"📊 *Resumen {now.strftime('%d/%m %H:%M')}*\n"
-                f"Sin señales. Mercados: XAUUSD · EURUSD · USDCHF · SP500 · Nasdaq\n"
-                f"_Próximo análisis en {CHECK_INTERVAL//3600}h_"
+                f"☀️ *Buenos días — {now_madrid.strftime('%d/%m/%Y %H:%M')} Madrid*\n\n"
+                f"Sin señales activas. Estado de mercados:\n{market_summary}\n\n"
+                f"_Análisis automático cada {CHECK_INTERVAL//3600}h. Te aviso si hay señal._ ✅"
             )
     else:
         log.info(f"Enviadas: {', '.join(found)}")
