@@ -73,8 +73,10 @@ RISK_REDUCED_PCT    = float(os.environ.get("RISK_REDUCED_PCT", "1.0"))
 RISK_BASE_PCT       = float(os.environ.get("RISK_BASE_PCT", "2.0"))
 
 # Umbrales de filtros adicionales
-VIX_THRESHOLD       = float(os.environ.get("VIX_THRESHOLD", "25.0"))   # VIX > 25 → reducir
-VIX_EXTREME         = float(os.environ.get("VIX_EXTREME", "35.0"))     # VIX > 35 → bloquear
+VIX_THRESHOLD       = float(os.environ.get("VIX_THRESHOLD", "25.0"))
+VIX_EXTREME         = float(os.environ.get("VIX_EXTREME", "35.0"))
+BRIDGE_URL          = os.environ.get("BRIDGE_URL", "")        # URL ngrok del bridge MT5
+BRIDGE_SECRET       = os.environ.get("BRIDGE_SECRET", "")     # clave secreta bridge
 
 SIGNALS_LOG = os.environ.get("SIGNALS_LOG_PATH", "/data/signals_log.json")
 
@@ -482,6 +484,47 @@ def ai_analysis_fn(symbol, market_info, signal_data, recal, hist_trades):
         return f"IA no disponible: {e}"
 
 
+
+def notify_bridge(symbol: str, market: dict, signal: dict,
+                  recal: dict, confidence: int, ai_text: str) -> bool:
+    """
+    Notifica al MT5 Bridge que hay una señal.
+    El bridge enviará a Telegram los botones de confirmación.
+    """
+    if not BRIDGE_URL or not BRIDGE_SECRET:
+        return False
+    try:
+        payload = {
+            "secret":     BRIDGE_SECRET,
+            "symbol":     symbol,
+            "name":       market["name"],
+            "signal":     signal["signal"],
+            "entry":      signal["entry"],
+            "sl":         signal["sl"],
+            "tp":         signal["tp"],
+            "sl_pct":     signal["sl_pct"],
+            "tp_pct":     signal["tp_pct"],
+            "risk_pct":   STATE.get("current_risk_pct", 1.5),
+            "confidence": confidence,
+            "ai_text":    ai_text[:500],
+            "rsi":        signal["rsi"],
+            "regime":     signal["regime"],
+            "vix":        STATE.get("vix", 0),
+        }
+        r = requests.post(
+            f"{BRIDGE_URL}/nueva_operacion",
+            json=payload,
+            timeout=10
+        )
+        if r.ok:
+            log.info(f"✅ Bridge notificado: {symbol} {signal['signal']}")
+            return True
+        log.warning(f"Bridge error: {r.status_code}")
+        return False
+    except Exception as e:
+        log.warning(f"Bridge no disponible: {e}")
+        return False
+
 def save_signal_log(symbol, signal, confidence, ai_text, result=None):
     try:
         os.makedirs(os.path.dirname(SIGNALS_LOG), exist_ok=True)
@@ -580,6 +623,17 @@ def run_cycle():
         if signal.get("signal") not in ("ESPERAR","SIN_DATOS"):
             log.info(f"⚡ SEÑAL {symbol} {signal['signal']} — llamando IA...")
             ai = ai_analysis_fn(symbol, mkt, signal, recal, hist)
+
+            # Si hay bridge MT5 activo → botones de confirmación en Telegram
+            if BRIDGE_URL and BRIDGE_SECRET:
+                bridge_ok = notify_bridge(symbol, mkt, signal, recal, conf, ai)
+                if bridge_ok:
+                    log.info(f"Bridge notificado — esperando confirmación del usuario")
+                    found.append(f"{symbol} {signal['signal']}")
+                    save_signal_log(symbol, signal, conf, ai)
+                    continue  # No mandar mensaje normal, el bridge lo gestiona
+
+            # Sin bridge → mensaje Telegram estándar
             msg = format_signal_msg(symbol, mkt, signal, recal, conf, ai, events)
             if msg:
                 send_telegram(msg)
