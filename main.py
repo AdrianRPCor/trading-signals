@@ -49,15 +49,32 @@ claude = Anthropic(api_key=ANTHROPIC_KEY)
 
 # Estado global compartido entre el hilo de análisis y el servidor web
 STATE = {
-    "last_update":   None,
-    "next_update":   None,
-    "markets":       {},
-    "signals_today": [],
-    "macro_events":  [],
-    "macro_blocked": False,
-    "signals_log":   [],
-    "system_ok":     True,
+    "last_update":        None,
+    "next_update":        None,
+    "markets":            {},
+    "signals_today":      [],
+    "macro_events":       [],
+    "macro_blocked":      False,
+    "signals_log":        [],
+    "system_ok":          True,
+    "consecutive_losses": 0,
+    "current_risk_pct":   2.0,
+    "risk_mode":          "normal",
+    "streak_since":       None,
+    "vix":                None,
+    "fed_bce_week":       False,
+    "fed_bce_reason":     "",
+    "risk_reason":        "Iniciando...",
 }
+
+# Parámetros de gestión de rachas
+STREAK_REDUCE_AFTER = int(os.environ.get("STREAK_REDUCE_AFTER", "3"))
+RISK_REDUCED_PCT    = float(os.environ.get("RISK_REDUCED_PCT", "1.0"))
+RISK_BASE_PCT       = float(os.environ.get("RISK_BASE_PCT", "2.0"))
+
+# Umbrales de filtros adicionales
+VIX_THRESHOLD       = float(os.environ.get("VIX_THRESHOLD", "25.0"))   # VIX > 25 → reducir
+VIX_EXTREME         = float(os.environ.get("VIX_EXTREME", "35.0"))     # VIX > 35 → bloquear
 
 SIGNALS_LOG = os.environ.get("SIGNALS_LOG_PATH", "/data/signals_log.json")
 
@@ -101,9 +118,7 @@ def fetch_macro_events() -> list:
 
 
 def is_macro_blocked(events: list) -> tuple[bool, str]:
-    """
-    Devuelve (True, razon) si estamos dentro de ventana ±2h de evento macro importante.
-    """
+    """Devuelve (True, razon) si estamos dentro de ventana ±2h de evento macro."""
     now_utc = datetime.now(timezone.utc)
     for ev in events:
         try:
@@ -118,6 +133,128 @@ def is_macro_blocked(events: list) -> tuple[bool, str]:
             continue
     return False, ""
 
+
+def fetch_vix() -> float:
+    """
+    Descarga el VIX actual desde yfinance.
+    VIX = índice de volatilidad del S&P500.
+    >25 = mercados nerviosos | >35 = pánico
+    """
+    try:
+        import yfinance as yf
+        vix = yf.Ticker("^VIX")
+        hist = vix.history(period="2d", interval="1h")
+        if not hist.empty:
+            val = float(hist["Close"].iloc[-1])
+            log.info(f"VIX actual: {val:.1f}")
+            STATE["vix"] = round(val, 1)
+            return val
+    except Exception as e:
+        log.warning(f"VIX no disponible: {e}")
+    STATE["vix"] = None
+    return 0.0
+
+
+def check_fed_bce_week() -> tuple[bool, str]:
+    """
+    Comprueba si esta semana hay reunión Fed o BCE usando Claude.
+    Si es semana de banco central → reducir riesgo toda la semana.
+    """
+    today = datetime.now(timezone.utc)
+    # Fed: normalmente semanas 2 y 6 de cada mes, martes-miércoles
+    # BCE: cada 6 semanas aprox, jueves
+    # Usamos Claude para confirmarlo con búsqueda web
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=150,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content":
+                f"¿Esta semana (semana del {today.strftime('%d %B %Y')}) hay reunión "
+                f"de la Fed (FOMC) o del BCE? Responde SOLO: SI o NO y el evento."
+            }]
+        )
+        text = " ".join(b.text for b in response.content if hasattr(b, "text")).strip().upper()
+        is_central_bank_week = text.startswith("SI") or "FOMC" in text or "FED" in text or "BCE" in text
+        reason = text[:100] if is_central_bank_week else ""
+        if is_central_bank_week:
+            log.info(f"⚠️ Semana de banco central: {reason}")
+            STATE["fed_bce_week"] = True
+            STATE["fed_bce_reason"] = reason
+        else:
+            STATE["fed_bce_week"] = False
+            STATE["fed_bce_reason"] = ""
+        return is_central_bank_week, reason
+    except Exception as e:
+        log.warning(f"Check Fed/BCE: {e}")
+        STATE["fed_bce_week"] = False
+        return False, ""
+
+
+def get_risk_level(events: list, vix: float, fed_bce_week: bool) -> tuple[float, str]:
+    """
+    Determina el % de riesgo según las 3 capas + racha:
+
+    Capa 1 — Evento ±2h:        0.0% (bloqueo total)
+    Capa 2 — VIX > 35:          0.0% (pánico extremo)
+    Capa 3 — VIX > 25:          0.5% (mercados nerviosos)
+    Capa 4 — Semana Fed/BCE:     1.0% (riesgo reducido semana)
+    Capa 5 — Racha ≥3 pérdidas: 1.0% (gestión de rachas)
+    Normal:                      2.0%
+    """
+    blocked, block_reason = is_macro_blocked(events)
+
+    if blocked:
+        return 0.0, f"🚫 BLOQUEADO: {block_reason}"
+
+    if vix >= VIX_EXTREME:
+        return 0.0, f"🚫 VIX EXTREMO ({vix:.1f} > {VIX_EXTREME}) — mercado en pánico"
+
+    if vix >= VIX_THRESHOLD:
+        risk = min(RISK_REDUCED_PCT, 0.5)
+        return risk, f"⚠️ VIX ALTO ({vix:.1f} > {VIX_THRESHOLD}) — riesgo reducido al {risk}%"
+
+    if fed_bce_week:
+        return RISK_REDUCED_PCT, f"⚠️ Semana Fed/BCE — riesgo reducido al {RISK_REDUCED_PCT}%"
+
+    if STATE["consecutive_losses"] >= STREAK_REDUCE_AFTER:
+        return RISK_REDUCED_PCT, f"⚠️ Racha {STATE['consecutive_losses']} pérdidas — riesgo reducido"
+
+    return RISK_BASE_PCT, f"✅ Condiciones normales — riesgo {RISK_BASE_PCT}%"
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GESTIÓN DE RACHAS Y TAMAÑO DE POSICIÓN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def update_streak(result: str):
+    """Actualiza el contador de pérdidas consecutivas y ajusta el riesgo."""
+    if result == "LOSS":
+        STATE["consecutive_losses"] += 1
+        if STATE["streak_since"] is None:
+            STATE["streak_since"] = datetime.now().strftime("%d/%m/%Y")
+    else:
+        STATE["consecutive_losses"] = 0
+        STATE["streak_since"] = None
+    STATE["current_risk_pct"] = RISK_REDUCED_PCT if STATE["consecutive_losses"] >= STREAK_REDUCE_AFTER else RISK_BASE_PCT
+    STATE["risk_mode"] = "reducido" if STATE["consecutive_losses"] >= STREAK_REDUCE_AFTER else "normal"
+
+
+def get_position_size(capital: float, entry: float, sl: float) -> dict:
+    """Calcula tamaño de posición y riesgo en dinero según estado de racha."""
+    risk_pct    = STATE["current_risk_pct"]
+    risk_amount = capital * risk_pct / 100
+    sl_pct      = abs(entry - sl) / entry * 100
+    note = (f"⚠️ REDUCIDO — {STATE['consecutive_losses']} pérdidas seguidas desde {STATE['streak_since']}"
+            if STATE["risk_mode"] == "reducido"
+            else f"✅ Normal ({risk_pct}% del capital)")
+    return {
+        "risk_pct": risk_pct, "risk_usd": round(risk_amount, 2),
+        "risk_mode": STATE["risk_mode"],
+        "consecutive_losses": STATE["consecutive_losses"],
+        "sl_distance_pct": round(sl_pct, 3), "note": note,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATOS Y ESTRATEGIA
@@ -294,6 +431,15 @@ def format_signal_msg(symbol, market, signal, recal, confidence, ai_text, macro_
     if macro_events:
         evs = " | ".join(f"{e.get('time','?')} {e.get('event','?')}" for e in macro_events[:3])
         macro_str = f"\n⚠️ _Eventos macro hoy: {evs}_"
+    # Tamaño de posición con riesgo real según capas
+    vix_val = STATE.get("vix", 0) or 0
+    risk_reason_short = STATE.get("risk_reason", "")[:60]
+    pos = get_position_size(10000, signal["entry"], signal["sl"])
+    risk_line = (
+        f"  💼 Riesgo: *{pos['risk_pct']}% del capital* = `${pos['risk_usd']:,.0f}` por $10k\n"
+        f"  📊 VIX: {vix_val:.1f} | {risk_reason_short}"
+    )
+
     return (
         f"{color} *SEÑAL — {market['emoji']} {market['name']} ({symbol})* {color}\n"
         f"{arrow}\n\n"
@@ -303,10 +449,11 @@ def format_signal_msg(symbol, market, signal, recal, confidence, ai_text, macro_
         f"  Stop Loss:   `{signal['sl']}` (-{signal['sl_pct']}%)\n"
         f"  Take Profit: `{signal['tp']}` (+{signal['tp_pct']}%)\n"
         f"  SL×{recal['sl']} TP×{recal['tp']} PF:{recal.get('pf_recent','?')}\n\n"
+        f"📐 *Tamaño de posición:*\n{risk_line}\n\n"
         f"📋 *Condiciones ({signal['conds_met']}/4):*\n{conds}\n"
         f"{macro_str}\n\n"
         f"🤖 _{ai_s}_\n\n"
-        f"⏰ _{signal['last_candle']}_ | _Max 2% capital/op_"
+        f"⏰ _{signal['last_candle']}_ | _Ajusta lotes según tu capital real_"
     )
 
 
@@ -335,7 +482,7 @@ def ai_analysis_fn(symbol, market_info, signal_data, recal, hist_trades):
         return f"IA no disponible: {e}"
 
 
-def save_signal_log(symbol, signal, confidence, ai_text):
+def save_signal_log(symbol, signal, confidence, ai_text, result=None):
     try:
         os.makedirs(os.path.dirname(SIGNALS_LOG), exist_ok=True)
         data = json.load(open(SIGNALS_LOG)) if os.path.exists(SIGNALS_LOG) else []
@@ -343,10 +490,16 @@ def save_signal_log(symbol, signal, confidence, ai_text):
                  "signal":signal["signal"],"price":signal["price"],
                  "entry":signal["entry"],"sl":signal["sl"],"tp":signal["tp"],
                  "confidence":confidence,"rsi":signal["rsi"],
-                 "regime":signal["regime"],"ai":ai_text[:200],"result":None}
+                 "regime":signal["regime"],"ai":ai_text[:200],
+                 "risk_pct":STATE["current_risk_pct"],
+                 "risk_mode":STATE["risk_mode"],
+                 "result":result}
         data.append(entry)
         json.dump(data[-500:], open(SIGNALS_LOG,"w"), indent=2)
-        STATE["signals_log"] = data[-20:]  # últimas 20 en memoria
+        STATE["signals_log"] = data[-20:]
+        # Actualizar racha si tenemos resultado
+        if result:
+            update_streak(result)
     except Exception as e:
         log.warning(f"Log: {e}")
 
@@ -365,21 +518,30 @@ def run_cycle():
     next_dt = now_madrid + timedelta(seconds=CHECK_INTERVAL)
     STATE["next_update"] = next_dt.strftime("%d/%m/%Y %H:%M")
 
-    # 1. Calendario económico
-    events = fetch_macro_events()
-    STATE["macro_events"] = events
-    blocked, block_reason = is_macro_blocked(events)
-    STATE["macro_blocked"] = blocked
+    # 1. Obtener todas las capas de protección
+    events       = fetch_macro_events()
+    vix          = fetch_vix()
+    fed_bce, fb_reason = check_fed_bce_week()
+    risk_pct, risk_reason = get_risk_level(events, vix, fed_bce)
 
-    if blocked:
-        log.warning(f"🚫 BLOQUEADO por macro: {block_reason}")
+    STATE["macro_events"]  = events
+    STATE["macro_blocked"] = (risk_pct == 0.0)
+    STATE["current_risk_pct"] = risk_pct
+    STATE["risk_reason"]   = risk_reason
+
+    vix_str = f"VIX: {vix:.1f}" if vix else "VIX: N/D"
+    log.info(f"Protecciones: {risk_reason} | {vix_str} | Fed/BCE semana: {fed_bce}")
+
+    if risk_pct == 0.0:
+        log.warning(f"🚫 OPERACIÓN BLOQUEADA: {risk_reason}")
         send_telegram(
-            f"⚠️ *Análisis bloqueado temporalmente*\n\n"
-            f"Motivo: {block_reason}\n"
-            f"La estrategia evita operar ±2h alrededor de eventos macro de alto impacto.\n"
-            f"_Reanudaré el análisis en el próximo ciclo._"
+            f"🚫 *Operación bloqueada*\n\n"
+            f"Motivo: {risk_reason}\n"
+            f"VIX actual: {vix:.1f if vix else 'N/D'}\n"
+            f"_El sistema reanudará en el próximo ciclo._"
         )
-        STATE["markets"] = {s: {"signal":"BLOQUEADO","regime":"—","rsi":0,"conds_met":0} for s in MARKETS}
+        STATE["markets"] = {s: {"signal":"BLOQUEADO","regime":"—","rsi":0,"conds_met":0,
+                                "name":MARKETS[s]["name"],"emoji":MARKETS[s]["emoji"]} for s in MARKETS}
         return
 
     # 2. Analizar mercados
