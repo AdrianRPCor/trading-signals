@@ -686,13 +686,23 @@ def dashboard():
 @app.route("/api/state")
 def api_state():
     """API JSON con el estado actual — la web lo consulta cada minuto."""
-    # Cargar log desde disco
     try:
         if os.path.exists(SIGNALS_LOG):
             STATE["signals_log"] = json.load(open(SIGNALS_LOG))[-20:]
     except Exception:
         pass
-    return jsonify(STATE)
+    # Convertir numpy bools y otros tipos no serializables
+    def clean(obj):
+        if isinstance(obj, dict):
+            return {k: clean(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [clean(i) for i in obj]
+        if hasattr(obj, 'item'):   # numpy scalar
+            return obj.item()
+        if isinstance(obj, bool):
+            return bool(obj)
+        return obj
+    return jsonify(clean(STATE))
 
 @app.route("/health")
 def health():
