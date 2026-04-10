@@ -1,0 +1,4 @@
+# Instalar SOLO en el PC con MT5 (no en Railway)
+MetaTrader5>=5.0.45
+requests>=2.31.0
+flask>=3.0.0
