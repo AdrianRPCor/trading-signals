@@ -17,7 +17,7 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +79,13 @@ BRIDGE_URL          = os.environ.get("BRIDGE_URL", "")        # URL ngrok del br
 BRIDGE_SECRET       = os.environ.get("BRIDGE_SECRET", "")     # clave secreta bridge
 
 SIGNALS_LOG = os.environ.get("SIGNALS_LOG_PATH", "/data/signals_log.json")
+
+# Cola de señales pendientes (bridge no disponible cuando llegó la señal)
+# Formato: {op_id: {payload, timestamp, expires_at}}
+PENDING_SIGNALS = {}
+PENDING_SIGNAL_TTL_HOURS = int(os.environ.get("PENDING_SIGNAL_TTL_HOURS", "8"))
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -520,10 +527,54 @@ def notify_bridge(symbol: str, market: dict, signal: dict,
             log.info(f"✅ Bridge notificado: {symbol} {signal['signal']}")
             return True
         log.warning(f"Bridge error: {r.status_code}")
+        _save_pending_signal(symbol, market, signal, confidence, ai_text)
         return False
     except Exception as e:
         log.warning(f"Bridge no disponible: {e}")
+        # Guardar señal como pendiente para cuando arranque el bridge
+        _save_pending_signal(symbol, market, signal, confidence, ai_text)
         return False
+
+
+
+def _save_pending_signal(symbol: str, market: dict, signal: dict,
+                         confidence: int, ai_text: str):
+    """Guarda señal pendiente cuando el bridge no está disponible."""
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(hours=PENDING_SIGNAL_TTL_HOURS)
+    op_id = f"pend_{symbol}_{int(now.timestamp())}"
+    PENDING_SIGNALS[op_id] = {
+        "op_id":      op_id,
+        "symbol":     symbol,
+        "name":       market["name"],
+        "signal":     signal["signal"],
+        "entry":      signal["entry"],
+        "sl":         signal["sl"],
+        "tp":         signal["tp"],
+        "sl_pct":     signal["sl_pct"],
+        "tp_pct":     signal["tp_pct"],
+        "risk_pct":   STATE.get("current_risk_pct", 1.5),
+        "confidence": confidence,
+        "ai_text":    ai_text[:500],
+        "rsi":        signal["rsi"],
+        "regime":     signal["regime"],
+        "vix":        STATE.get("vix", 0),
+        "detected_at": now.isoformat(),
+        "expires_at":  expires.isoformat(),
+        "secret":     BRIDGE_SECRET,
+    }
+    # Limpiar expiradas
+    _clean_expired_signals()
+    log.info(f"📋 Señal pendiente guardada: {symbol} {signal['signal']} — expira {expires.strftime('%H:%M')} UTC")
+
+def _clean_expired_signals():
+    """Elimina señales que han superado el TTL."""
+    now = datetime.now(timezone.utc)
+    expired = [k for k, v in PENDING_SIGNALS.items()
+               if datetime.fromisoformat(v["expires_at"]) < now]
+    for k in expired:
+        s = PENDING_SIGNALS.pop(k)
+        log.info(f"⏰ Señal expirada eliminada: {s['symbol']} {s['signal']} (detectada {s['detected_at'][:16]})")
 
 def save_signal_log(symbol, signal, confidence, ai_text, result=None):
     try:
@@ -920,9 +971,24 @@ def api_state():
         return obj
     return jsonify(clean(STATE))
 
+@app.route("/pending_signals")
+def pending_signals():
+    """El bridge consulta este endpoint al arrancar para ver señales perdidas."""
+    _clean_expired_signals()
+    secret = request.args.get("secret", "") if hasattr(request, "args") else ""
+    if secret != BRIDGE_SECRET and BRIDGE_SECRET:
+        return jsonify({"error": "Unauthorized"}), 401
+    now = datetime.now(timezone.utc)
+    result = []
+    for op_id, sig in list(PENDING_SIGNALS.items()):
+        expires = datetime.fromisoformat(sig["expires_at"])
+        hours_left = (expires - now).total_seconds() / 3600
+        result.append({**sig, "hours_left": round(hours_left, 1)})
+    return jsonify({"pending": result, "count": len(result)})
+
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "ts": datetime.now().isoformat()})
+    return jsonify({"ok": True, "ts": datetime.now().isoformat(), "pending_signals": len(PENDING_SIGNALS)})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
